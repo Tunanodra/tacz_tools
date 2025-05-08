@@ -1,215 +1,255 @@
+# gunpack_parser.py
 import os
-import json
 import zipfile
 import tempfile
+import json
 import shutil
-import glob
 import subprocess
 import sys
 
+# Ensure gunpack_generator is importable for testing incremental add
+from gunpack_generator import add_new_weapon_files, add_new_ammo_files, add_new_attachment_files
+
 class GunpackParser:
-    def __init__(self, gunpack_path):
-        self.gunpack_path = os.path.abspath(gunpack_path)
-        self.temp_dir = None
-        self.pack_root = None
+    def __init__(self, pack_path):
+        self.pack_path = pack_path
+        self.temp_dir_obj = None
+        self.gunpack_root_dir = None
         self.namespace = None
+        self.is_loaded_from_zip = False
         self.weapons_data = {}
+        self.ammo_data = {}
+        self.attachment_data = {}
 
-        self._prepare_gunpack()
-        if self.pack_root:
-            self._determine_namespace()
-            if self.namespace:
-                self._find_weapons_and_assets()
+        self._load_pack()
 
-    def _prepare_gunpack(self):
-        if not os.path.exists(self.gunpack_path):
-            print(f"Error: Gunpack path does not exist: {self.gunpack_path}")
-            return
-
-        if zipfile.is_zipfile(self.gunpack_path):
-            self.temp_dir = tempfile.mkdtemp(prefix="tacz_gui_")
-            try:
-                with zipfile.ZipFile(self.gunpack_path, 'r') as zip_ref:
-                    zip_infos = zip_ref.infolist()
-                    if not zip_infos:
-                        print("Error: Zip file is empty.")
-                        return
+    def _find_gunpack_root_and_namespace(self, base_search_path):
+        for root, dirs, files in os.walk(base_search_path):
+            if "gunpack_info.json" in files:
+                if os.path.basename(os.path.dirname(root)) == "assets":
+                    self.namespace = os.path.basename(root)
+                    potential_gunpack_root = os.path.abspath(os.path.join(root, "..", ".."))
                     
-                    first_level_dirs = set()
-                    for member in zip_infos:
-                        parts = member.filename.split('/')
-                        if len(parts) > 1:
-                            first_level_dirs.add(parts[0])
-                    
-                    if len(first_level_dirs) == 1:
-                        zip_ref.extractall(self.temp_dir)
-                        self.pack_root = os.path.join(self.temp_dir, list(first_level_dirs)[0])
-                        print(f"Extracted zip to temp directory: {self.pack_root}")
+                    # Check if potential_gunpack_root is consistent with base_search_path
+                    # This logic ensures that if base_search_path is already the gunpack root, it's used.
+                    # Or if base_search_path is one level above (e.g. extracted zip root), it's also handled.
+                    if os.path.abspath(base_search_path) == potential_gunpack_root or \
+                       os.path.abspath(os.path.dirname(potential_gunpack_root)) == os.path.abspath(base_search_path) and os.path.basename(potential_gunpack_root) == os.listdir(base_search_path)[0] and len(os.listdir(base_search_path))==1 :
+                         self.gunpack_root_dir = potential_gunpack_root
+                    elif "assets" in os.listdir(base_search_path) and os.path.join(base_search_path, "assets", self.namespace) == root:
+                         self.gunpack_root_dir = os.path.abspath(base_search_path)
                     else:
-                        zip_name_no_ext = os.path.splitext(os.path.basename(self.gunpack_path))[0]
-                        extract_target_dir = os.path.join(self.temp_dir, zip_name_no_ext)
-                        zip_ref.extractall(extract_target_dir)
-                        self.pack_root = extract_target_dir
-                        print(f"Extracted zip (no single root) to temp directory: {self.pack_root}")
+                        # If gunpack_info.json is found deeper, but doesn't align with base_search_path as root or parent-of-root
+                        # it might be a nested pack or incorrect structure. For now, we prioritize alignment.
+                        # This could be an area for more sophisticated root detection if needed.
+                        print(f"Debug: gunpack_info.json found at {root}, but its derived root {potential_gunpack_root} does not align well with base_search_path {base_search_path}. Skipping this instance.")
+                        self.namespace = None
+                        self.gunpack_root_dir = None
+                        continue
 
-            except Exception as e:
-                print(f"Error extracting zip file: {e}")
-                self.cleanup()
-                return
-        elif os.path.isdir(self.gunpack_path):
-            self.pack_root = self.gunpack_path
-            print(f"Using directory as gunpack root: {self.pack_root}")
-        else:
-            print(f"Error: Gunpack path is not a valid zip file or directory: {self.gunpack_path}")
+                    try:
+                        with open(os.path.join(root, "gunpack_info.json"), 'r', encoding='utf-8') as f_info:
+                            info_data = json.load(f_info)
+                        if 'namespace' in info_data and info_data['namespace'] != self.namespace:
+                            print(f"Warning: Namespace in gunpack_info.json (	'{info_data['namespace']}	') differs from directory structure (	'{self.namespace}	'). Using directory structure derived namespace: 	'{self.namespace}	'.")
+                        return True
+                    except Exception as e:
+                        print(f"Warning: Could not parse gunpack_info.json at {os.path.join(root, 'gunpack_info.json')}: {e}")
+                        self.namespace = None
+                        self.gunpack_root_dir = None
+                        continue
+        return False
 
-    def _determine_namespace(self):
-        if not self.pack_root:
-            return
-        # 尝试搜索命名空间内文件夹
-        for base_folder in ["assets", "data"]:
-            base_path = os.path.join(self.pack_root, base_folder)
-            if os.path.isdir(base_path):
-                subdirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
-                if subdirs:
-                    self.namespace = subdirs[0]
-                    print(f"Determined namespace: {self.namespace}")
-                    return
-        meta_path = os.path.join(self.pack_root, "gunpack.meta.json")
-        if os.path.exists(meta_path):
+    def _load_pack(self):
+        if os.path.isdir(self.pack_path):
+            self.is_loaded_from_zip = False
+            if not self._find_gunpack_root_and_namespace(self.pack_path):
+                self.gunpack_root_dir = self.pack_path # Fallback, might not have namespace
+                print(f"Warning: Could not reliably determine namespace from {self.pack_path} via gunpack_info.json. Operations requiring namespace may fail or be limited.")
+        elif os.path.isfile(self.pack_path) and self.pack_path.endswith(".zip"):
+            self.is_loaded_from_zip = True
+            self.temp_dir_obj = tempfile.TemporaryDirectory(prefix="tacz_viewer_")
+            extracted_zip_path = self.temp_dir_obj.name
             try:
-                with open(meta_path, 'r') as f:
-                    meta_data = json.load(f)
-                    if "namespace" in meta_data:
-                        self.namespace = meta_data["namespace"]
-                        print(f"Determined namespace from gunpack.meta.json: {self.namespace}")
-                        return
+                with zipfile.ZipFile(self.pack_path, 'r') as zip_ref:
+                    zip_ref.extractall(extracted_zip_path)
+                
+                if not self._find_gunpack_root_and_namespace(extracted_zip_path):
+                    extracted_items = os.listdir(extracted_zip_path)
+                    if len(extracted_items) == 1 and os.path.isdir(os.path.join(extracted_zip_path, extracted_items[0])):
+                        potential_root_in_zip = os.path.join(extracted_zip_path, extracted_items[0])
+                        if not self._find_gunpack_root_and_namespace(potential_root_in_zip):
+                            self.gunpack_root_dir = potential_root_in_zip
+                            print(f"Warning: Found single folder in zip but could not determine namespace from {self.gunpack_root_dir} via gunpack_info.json.")
+                    else:
+                        self.gunpack_root_dir = extracted_zip_path
+                        print(f"Warning: Could not determine namespace from extracted zip contents of {self.pack_path} via gunpack_info.json.")
             except Exception as e:
-                print(f"Error reading gunpack.meta.json: {e}")
+                self.cleanup()
+                raise Exception(f"Failed to extract or process zip file: {e}")
+        else:
+            raise Exception(f"Invalid pack path: {self.pack_path}. Must be a directory or .zip file.")
+
+        if self.gunpack_root_dir and self.namespace:
+            self._parse_all_items()
+        elif self.gunpack_root_dir:
+            print(f"Warning: Gunpack root is 	'{self.gunpack_root_dir}	' but namespace could not be determined. Viewer and modification features will be limited.")
+        else:
+             raise Exception("Could not determine gunpack root directory. Cannot load pack.")
+
+    def _parse_item_category(self, category_name, data_dict):
+        if not self.gunpack_root_dir or not self.namespace: return
         
-        if not self.namespace:
-            print("Error: Could not determine namespace.")
+        index_dir = os.path.join(self.gunpack_root_dir, f"data/{self.namespace}/index/{category_name}")
+        data_dir = os.path.join(self.gunpack_root_dir, f"data/{self.namespace}/data/{category_name}")
+        display_dir = os.path.join(self.gunpack_root_dir, f"assets/{self.namespace}/display/{category_name}")
+        geo_dir_name = 'gun' if category_name == 'guns' else category_name # Handle 'gun' vs 'guns'
+        geo_dir = os.path.join(self.gunpack_root_dir, f"assets/{self.namespace}/geo_models/{geo_dir_name}")
+        texture_dir_uv_name = 'gun' if category_name == 'guns' else category_name
+        texture_dir_uv = os.path.join(self.gunpack_root_dir, f"assets/{self.namespace}/textures/{texture_dir_uv_name}/uv")
+        texture_dir_slot = os.path.join(self.gunpack_root_dir, f"assets/{self.namespace}/textures/{texture_dir_uv_name}/slot")
+        sound_base_dir = os.path.join(self.gunpack_root_dir, f"assets/{self.namespace}/tacz_sounds")
 
-    def _find_weapons_and_assets(self):
-        if not self.namespace or not self.pack_root:
-            return
+        if os.path.isdir(index_dir):
+            for fname in os.listdir(index_dir):
+                if fname.endswith(".json"):
+                    item_id = fname[:-5]
+                    item_assets = {"json_files": [], "model_files": [], "texture_files": [], "sound_files": []}
+                    
+                    for d, n_suffix in [(index_dir, ""), (data_dir, ""), (display_dir, "_display")]:
+                        p = os.path.join(d, f"{item_id}{n_suffix}.json")
+                        if os.path.isfile(p): item_assets["json_files"].append(p)
+                    
+                    if os.path.isdir(geo_dir):
+                        for m_fname in os.listdir(geo_dir):
+                            if item_id in m_fname and m_fname.endswith(".json"): 
+                                item_assets["model_files"].append(os.path.join(geo_dir, m_fname))
+                    
+                    for tex_d in [texture_dir_uv, texture_dir_slot]:
+                        if os.path.isdir(tex_d):
+                            for t_fname in os.listdir(tex_d):
+                                if item_id in t_fname and t_fname.endswith(".png"): 
+                                    item_assets["texture_files"].append(os.path.join(tex_d, t_fname))
+                    
+                    if category_name == "guns":
+                        s_dir = os.path.join(sound_base_dir, item_id)
+                        if os.path.isdir(s_dir):
+                            for sf in os.listdir(s_dir):
+                                if sf.endswith(".ogg") or sf.endswith(".wav"): 
+                                    item_assets["sound_files"].append(os.path.join(s_dir, sf))
+                    
+                    data_dict[item_id] = {"id": item_id, "assets": item_assets}
 
-        index_guns_path = os.path.join(self.pack_root, "data", self.namespace, "index", "guns")
-        if not os.path.isdir(index_guns_path):
-            print(f"Error: Gun index directory not found: {index_guns_path}")
-            return
-
-        for weapon_file in os.listdir(index_guns_path):
-            if weapon_file.endswith(".json"):
-                weapon_id = weapon_file[:-5] # Remove .json
-                self.weapons_data[weapon_id] = {"id": weapon_id, "assets": {}}
-                self._collect_assets_for_weapon(weapon_id)
-        print(f"Found {len(self.weapons_data)} weapons.")
-
-    def _get_asset_path(self, category_path_template, weapon_id, file_pattern_template, is_dir=False):
-        """Helper to get asset paths, supporting wildcards in file_pattern_template."""
-        base_asset_path = category_path_template.replace("[namespace]", self.namespace).replace("[weapon_id]", weapon_id)
-        full_category_path = os.path.join(self.pack_root, base_asset_path)
-        
-        assets_found = []
-        if os.path.isdir(full_category_path):
-            if is_dir:
-                assets_found.append(full_category_path)
-            else:
-                file_pattern = file_pattern_template.replace("[weapon_id]", weapon_id)
-                for f_path in glob.glob(os.path.join(full_category_path, file_pattern)):
-                    if os.path.isfile(f_path):
-                         assets_found.append(f_path)
-        elif os.path.isfile(full_category_path) and not is_dir: 
-             assets_found.append(full_category_path)
-        return assets_found
-
-    def _collect_assets_for_weapon(self, weapon_id):
-        assets = {}
-        asset_map = {
-            "index_file": ("data/[namespace]/index/guns", "[weapon_id].json"),
-            "data_file": ("data/[namespace]/data/guns", "[weapon_id].json"),
-            "model_main": ("assets/[namespace]/geo_models/gun", "[weapon_id].geo.json"), # Assuming .geo.json
-            "model_lod": ("assets/[namespace]/geo_models/gun/lod", "[weapon_id]_lod*.geo.json"),
-            "texture_uv": ("assets/[namespace]/textures/gun/uv", "[weapon_id].png"),
-            "texture_hud": ("assets/[namespace]/textures/gun/hud", "[weapon_id]*.png"), # More flexible pattern
-            "texture_slot": ("assets/[namespace]/textures/gun/slot", "[weapon_id]*.png"),
-            "texture_lod": ("assets/[namespace]/textures/gun/lod", "[weapon_id]_lod*.png"),
-            "display_json": ("assets/[namespace]/display/guns", "[weapon_id]_display.json"),
-            "animation_bedrock": ("assets/[namespace]/animations", "[weapon_id].animation.json"),
-            "animation_gltf": ("assets/[namespace]/animations", "[weapon_id].gltf"),
-            "sounds_dir": ("assets/[namespace]/tacz_sounds/[weapon_id]", "*", True), # True indicates it's a directory
-            "recipe_gun": ("data/[namespace]/recipes/gun", "[weapon_id].json"),
-            "tags_allow_attachments": ("data/[namespace]/tacz_tags/attachments/allow_attachments", "[weapon_id].json"),
-            "script_lua": ("data/[namespace]/scripts", f"{weapon_id}_gun_logic.lua") 
-        }
-
-        for key, (path_template, file_pattern, *is_dir_flag) in asset_map.items():
-            is_dir = is_dir_flag[0] if is_dir_flag else False
-            found_paths = self._get_asset_path(path_template, weapon_id, file_pattern, is_dir)
-            if found_paths:
-                assets[key] = found_paths if len(found_paths) > 1 or is_dir else found_paths[0]
-        
-        self.weapons_data[weapon_id]["assets"] = assets
+    def _parse_all_items(self):
+        self._parse_item_category("guns", self.weapons_data)
+        self._parse_item_category("ammo", self.ammo_data)
+        self._parse_item_category("attachments", self.attachment_data)
 
     def get_weapons_data(self):
         return self.weapons_data
 
     def cleanup(self):
-        if self.temp_dir and os.path.exists(self.temp_dir):
+        if self.temp_dir_obj:
             try:
-                shutil.rmtree(self.temp_dir)
-                print(f"Cleaned up temp directory: {self.temp_dir}")
+                self.temp_dir_obj.cleanup()
             except Exception as e:
-                print(f"Error cleaning up temp directory {self.temp_dir}: {e}")
-        self.temp_dir = None
-        self.pack_root = None
-
+                print(f"Error cleaning up temporary directory {self.temp_dir_obj.name}: {e}")
+            self.temp_dir_obj = None
+            
     @staticmethod
     def open_file_externally(file_path):
         try:
             if sys.platform == "win32":
                 os.startfile(file_path)
-            elif sys.platform == "darwin": # macOS
+            elif sys.platform == "darwin":
                 subprocess.Popen(["open", file_path])
-            else: # linux
+            else: 
                 subprocess.Popen(["xdg-open", file_path])
-            print(f"Attempting to open file: {file_path}")
         except Exception as e:
             print(f"Error opening file {file_path}: {e}")
 
 if __name__ == "__main__":
-    test_pack_path = "test_gun_pack"
-    if os.path.exists(test_pack_path):
-        shutil.rmtree(test_pack_path)
-    os.makedirs(os.path.join(test_pack_path, "assets/testns/geo_models/gun"), exist_ok=True)
-    os.makedirs(os.path.join(test_pack_path, "assets/testns/textures/gun/uv"), exist_ok=True)
-    os.makedirs(os.path.join(test_pack_path, "assets/testns/tacz_sounds/testgun1"), exist_ok=True)
-    os.makedirs(os.path.join(test_pack_path, "data/testns/index/guns"), exist_ok=True)
-    os.makedirs(os.path.join(test_pack_path, "data/testns/data/guns"), exist_ok=True)
-
-    with open(os.path.join(test_pack_path, "data/testns/index/guns/testgun1.json"), 'w') as f: json.dump({"id": "testgun1"}, f)
-    with open(os.path.join(test_pack_path, "data/testns/data/guns/testgun1.json"), 'w') as f: json.dump({"damage": 10}, f)
-    with open(os.path.join(test_pack_path, "assets/testns/geo_models/gun/testgun1.geo.json"), 'w') as f: json.dump({}, f)
-    with open(os.path.join(test_pack_path, "assets/testns/textures/gun/uv/testgun1.png"), 'w') as f: f.write("dummy png content")
-    with open(os.path.join(test_pack_path, "assets/testns/tacz_sounds/testgun1/fire.ogg"), 'w') as f: f.write("dummy ogg content")
+    test_pack_dir = "/tmp/dummy_gunpack_parser_test"
+    if os.path.exists(test_pack_dir): shutil.rmtree(test_pack_dir)
     
-    print("--- Testing with dummy folder pack ---")
-    parser_folder = GunpackParser(test_pack_path)
-    data_folder = parser_folder.get_weapons_data()
-    print(json.dumps(data_folder, indent=2))
-    parser_folder.cleanup()
+    dummy_namespace = "testns"
+    # Create a structure that matches what _find_gunpack_root_and_namespace expects
+    # i.e. test_pack_dir IS the gunpack root.
+    os.makedirs(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/textures/gun/uv"), exist_ok=True)
+    os.makedirs(os.path.join(test_pack_dir, f"data/{dummy_namespace}/index/guns"), exist_ok=True)
+    os.makedirs(os.path.join(test_pack_dir, f"data/{dummy_namespace}/data/guns"), exist_ok=True)
+    os.makedirs(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/display/guns"), exist_ok=True)
+    os.makedirs(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/geo_models/gun"), exist_ok=True)
+    os.makedirs(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/tacz_sounds/test_gun"), exist_ok=True)
 
-    zip_example_path = "your example gunpack zip file"
-    if os.path.exists(zip_example_path):
-        print("\n--- Testing with user example gunpack ---")
-        parser_zip = GunpackParser(zip_example_path)
-        data_zip = parser_zip.get_weapons_data()
-        if "ak47" in data_zip:
-            print("AK47 data found:")
-            print(json.dumps(data_zip["ak47"], indent=2))
+    with open(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/gunpack_info.json"), "w") as f:
+        json.dump({"namespace": dummy_namespace, "pack_format": 1, "name": "Dummy Test Pack"}, f)
+    with open(os.path.join(test_pack_dir, f"data/{dummy_namespace}/index/guns/test_gun.json"), "w") as f:
+        json.dump({"id": f"{dummy_namespace}:test_gun"}, f)
+    with open(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/geo_models/gun/test_gun.geo.json"), "w") as f: json.dump({},f)
+    with open(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/textures/gun/uv/test_gun.png"), "w") as f: f.write("dummy png")
+    with open(os.path.join(test_pack_dir, f"assets/{dummy_namespace}/tacz_sounds/test_gun/fire.ogg"), "w") as f: f.write("dummy ogg")
+
+    print(f"--- Testing with folder: {test_pack_dir} ---")
+    parser = None
+    try:
+        parser = GunpackParser(test_pack_dir)
+        print(f"Detected Namespace: {parser.namespace}")
+        print(f"Gunpack Root: {parser.gunpack_root_dir}")
+        print(f"Is from ZIP: {parser.is_loaded_from_zip}")
+        print(f"Weapons Data: {json.dumps(parser.get_weapons_data(), indent=2)}")
+
+        # Test incremental add to this loaded pack (folder)
+        if parser and parser.gunpack_root_dir and parser.namespace:
+            print("\n--- Testing incremental add (to folder) ---")
+            new_rifle_id = "added_rifle"
+            success, msg = add_new_weapon_files(parser.gunpack_root_dir, parser.namespace, new_rifle_id)
+            print(f"Add new weapon 	'{new_rifle_id}	': {success} - {msg}")
+            expected_rifle_index_path = os.path.join(parser.gunpack_root_dir, f"data/{parser.namespace}/index/guns/{new_rifle_id}.json")
+            if os.path.exists(expected_rifle_index_path):
+                print(f"SUCCESS: New rifle index file created at: {expected_rifle_index_path}")
+            else:
+                print(f"FAILURE: New rifle index file NOT found at: {expected_rifle_index_path}")
         else:
-            print("AK47 not found in parsed zip data.")
-        parser_zip.cleanup()
-    else:
-        print(f"\nSkipping zip test: {zip_example_path} not found.")
+            print("Skipping incremental add test (folder) due to parser init issues.")
+    except Exception as e:
+        print(f"Error during folder test: {e}")
+    finally:
+        if parser: parser.cleanup() # Though for folder, this does nothing to original files
+
+    # Test with a ZIP file
+    zip_path = "/tmp/dummy_gunpack_parser_test.zip"
+    if os.path.exists(zip_path): os.remove(zip_path)
+    shutil.make_archive(zip_path[:-4], 'zip', test_pack_dir) # Zip the dummy pack
+    
+    print(f"\n--- Testing with ZIP: {zip_path} ---")
+    parser_zip = None
+    try:
+        parser_zip = GunpackParser(zip_path)
+        print(f"Detected Namespace (zip): {parser_zip.namespace}")
+        print(f"Gunpack Root (zip, temp): {parser_zip.gunpack_root_dir}")
+        print(f"Is from ZIP (zip): {parser_zip.is_loaded_from_zip}")
+        print(f"Weapons Data (zip): {json.dumps(parser_zip.get_weapons_data(), indent=2)}")
+
+        # Test incremental add to this loaded pack (from ZIP, so to temp dir)
+        if parser_zip and parser_zip.gunpack_root_dir and parser_zip.namespace:
+            print("\n--- Testing incremental add (to temp dir from ZIP) ---")
+            new_pistol_id = "added_pistol_temp"
+            success, msg = add_new_weapon_files(parser_zip.gunpack_root_dir, parser_zip.namespace, new_pistol_id)
+            print(f"Add new weapon 	'{new_pistol_id}	': {success} - {msg}")
+            expected_pistol_index_path = os.path.join(parser_zip.gunpack_root_dir, f"data/{parser_zip.namespace}/index/guns/{new_pistol_id}.json")
+            if os.path.exists(expected_pistol_index_path):
+                print(f"SUCCESS: New pistol index file created in temp dir at: {expected_pistol_index_path}")
+            else:
+                print(f"FAILURE: New pistol index file NOT found in temp dir at: {expected_pistol_index_path}")
+        else:
+            print("Skipping incremental add test (zip) due to parser init issues.")
+    except Exception as e:
+        print(f"Error during zip test: {e}")
+    finally:
+        if parser_zip: parser_zip.cleanup() # This will delete the temp dir
+    
+    if os.path.exists(test_pack_dir): shutil.rmtree(test_pack_dir)
+    if os.path.exists(zip_path): os.remove(zip_path)
+    print("\nParser tests complete.")
 
