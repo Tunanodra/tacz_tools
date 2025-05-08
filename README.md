@@ -1,2 +1,2 @@
 # tacz_tools
-A helper for tacz 1.1.4
+A tool for tacz 1.1.4
