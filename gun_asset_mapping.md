@@ -60,7 +60,7 @@ GUI工具应基于`data/[命名空间]/index/guns/`目录下的文件列出武�
 
 ### 2.7. 玩家动画（第三人称动画）
 
-*   与玩家模型持枪动画相关的文件：`assets/[命名空间]/player_animator/`（文件可能命名为`[武器ID]_player.animation.json`或采用其他约定。示例中包含`rifle.animation.json`、`pistol.animation.json`等文件，表明玩家动画可能基于武器类型而非特定ID进行通用映射。GUI工具开发时需谨慎考虑，可能需要关联武器数据文件中定义的通用动画类型）
+*   与玩家模型持枪动画相关的文件：`assets/[命名空间]/player_animator/`（示例中包含`rifle.animation.json`、`pistol.animation.json`等文件
 
 ## 3. 发现武器与命名空间
 
